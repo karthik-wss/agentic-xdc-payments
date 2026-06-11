@@ -118,3 +118,5 @@ xdc-usdc-agent/
 - Transactions use **legacy type 0** (not EIP-1559)
 - Minimum gas price: **12.5 gwei**
 - Block explorer: https://xdcscan.com
+
+## Disclaimer:- This application uses AI to interpret natural language instructions. While safety checks are implemented, AI-generated outputs may be incorrect or incomplete. Always review transaction details carefully before confirming any transaction. The user remains fully responsible for all transactions executed through the application.
