@@ -1,0 +1,17 @@
+{
+  "name": "xdc-usdc-ai-agent",
+  "version": "1.0.0",
+  "description": "AI agent that sends USDC on XDC Network via natural language instructions",
+  "type": "module",
+  "main": "src/agent.js",
+  "scripts": {
+    "start": "node src/agent.js",
+    "dev": "node --watch src/agent.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.20.0",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.11.1",
+    "readline": "^1.3.0"
+  }
+}
