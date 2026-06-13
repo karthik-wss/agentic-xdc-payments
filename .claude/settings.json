@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e ' *)",
+      "WebFetch(domain:api.apothem.blocksscan.io)",
+      "WebFetch(domain:explorer.apothem.network)",
+      "WebFetch(domain:developers.circle.com)",
+      "Bash(node --check src/tokens.js)",
+      "Bash(node --check src/erc20.js)",
+      "Bash(node --check src/agent.js)",
+      "Bash(node --check src/swap.js)",
+      "Bash(node --check src/parser.js)",
+      "Bash(USDC_CONTRACT_ADDRESS=0xfa2958cb79b0491cc627c1557f441ef849ca8eb1 TOKENS=USDT:0x83249c6794BCa5a77Eb8c0AF9F1A86E055459cea,WXDC:xdc951857744785E80e2De051c32EE7b25f9c458C42 node --input-type=module -e ' *)",
+      "WebSearch",
+      "WebFetch(domain:docs.xspswap.finance)",
+      "Bash(timeout 60 node src/agent.js)",
+      "Bash(node src/agent.js)",
+      "Bash(node --input-type=module -e ' *)",
+      "Bash(git check-ignore *)"
+    ]
+  }
+}

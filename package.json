@@ -1,7 +1,7 @@
 {
-  "name": "xdc-usdc-ai-agent",
-  "version": "1.0.0",
-  "description": "AI agent that sends USDC on XDC Network via natural language instructions",
+  "name": "xdc-multi-token-ai-agent",
+  "version": "2.0.0",
+  "description": "AI agent for XDC Network: send native XDC / ERC-20 tokens and swap on a DEX via natural language",
   "type": "module",
   "main": "src/agent.js",
   "scripts": {

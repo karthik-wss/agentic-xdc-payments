@@ -1,7 +1,15 @@
 import "dotenv/config";
 import readline from "readline";
 import { loadProvider, loadWallet } from "./wallet.js";
-import { getBalances, sendUSDC, normalizeAddress, isValidAddress } from "./usdc.js";
+import {
+  getTokenBalance,
+  sendToken,
+  sendNative,
+  normalizeAddress,
+  isValidAddress,
+} from "./erc20.js";
+import { resolveToken, listTokens } from "./tokens.js";
+import { quoteSwap, executeSwap } from "./swap.js";
 import { parseInstruction } from "./parser.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -10,7 +18,7 @@ const EXPLORER = "https://xdcscan.com/tx/";
 const MAX_SEND = parseFloat(process.env.MAX_SEND_AMOUNT || "1000");
 const REQUIRE_CONFIRM = process.env.REQUIRE_CONFIRMATION !== "false";
 
-function log(msg) { console.log(msg); }
+function log(msg = "") { console.log(msg); }
 function info(msg) { console.log(`  ℹ  ${msg}`); }
 function success(msg) { console.log(`  ✓  ${msg}`); }
 function warn(msg) { console.log(`  ⚠  ${msg}`); }
@@ -21,22 +29,45 @@ function prompt(rl, question) {
   return new Promise((resolve) => rl.question(question, resolve));
 }
 
+/**
+ * Fetches balances for every registered token.
+ * @returns {Promise<Array<{ symbol, balance }>>}
+ */
+async function fetchBalances(provider, wallet) {
+  const tokens = listTokens();
+  return Promise.all(
+    tokens.map(async (token) => {
+      try {
+        return { symbol: token.symbol, balance: await getTokenBalance(provider, wallet.address, token) };
+      } catch {
+        return { symbol: token.symbol, balance: "—" };
+      }
+    })
+  );
+}
+
+function printBalances(balances) {
+  for (const { symbol, balance } of balances) {
+    info(`${symbol.padEnd(6)}: ${balance}`);
+  }
+}
+
 function printBanner(walletAddress, balances) {
   console.log("\n");
   console.log("  ╔══════════════════════════════════════════════════════╗");
-  console.log("  ║          XDC USDC AI Agent  ·  v1.0.0               ║");
+  console.log("  ║          XDC Multi-Token AI Agent  ·  v2.0.0         ║");
   console.log("  ╚══════════════════════════════════════════════════════╝");
   console.log();
   info(`Wallet  : ${walletAddress}`);
-  info(`XDC     : ${balances.xdc} XDC`);
-  info(`USDC    : ${balances.usdc} ${balances.symbol}`);
+  printBalances(balances);
   info(`Network : ${process.env.XDC_RPC_URL || "https://rpc.xinfin.network"}`);
-  info(`Confirm : ${REQUIRE_CONFIRM ? "ON (you will approve each send)" : "OFF (auto-sends)"}`);
+  info(`Confirm : ${REQUIRE_CONFIRM ? "ON (you will approve each action)" : "OFF (auto-executes)"}`);
   console.log();
-  info('Type a natural instruction, e.g:');
+  info("Type a natural instruction, e.g:");
   info('  "Send 10 USDC to xdc1a2b3c..."');
-  info('  "What is my USDC balance?"');
-  info('  "Transfer 5.5 USDC to 0xABCD..."');
+  info('  "Send 5 XDC to 0xABCD..."');
+  info('  "Swap 100 USDC to XDC"');
+  info('  "What are my balances?"');
   info('  Type "exit" to quit.');
   console.log();
 }
@@ -44,32 +75,41 @@ function printBanner(walletAddress, balances) {
 // ── Transfer handler ─────────────────────────────────────────────────────────
 
 async function handleTransfer(rl, wallet, provider, parsed) {
-  const { to, amount, message } = parsed;
+  const { to, amount } = parsed;
 
-  // Validate address
+  // Resolve token (default USDC for backward-compat, handled by the parser too).
+  const token = resolveToken(parsed.token || "USDC");
+  if (!token) {
+    error(`Unknown token: "${parsed.token}". Supported: ${listTokens().map((t) => t.symbol).join(", ")}`);
+    return;
+  }
+
   if (!isValidAddress(to)) {
     error(`Invalid address: "${to}"`);
     return;
   }
 
-  // Enforce max send limit
+  if (!(amount > 0)) {
+    error(`Invalid amount: "${amount}".`);
+    return;
+  }
+
   if (amount > MAX_SEND) {
-    error(`Amount ${amount} USDC exceeds safety limit of ${MAX_SEND} USDC.`);
-    warn(`Edit MAX_SEND_AMOUNT in .env to raise the limit.`);
+    error(`Amount ${amount} ${token.symbol} exceeds safety limit of ${MAX_SEND}.`);
+    warn(`Edit MAX_SEND_AMOUNT in .env to raise the limit. (Note: limit is a raw number, not USD-normalized.)`);
     return;
   }
 
   const normalizedTo = normalizeAddress(to);
 
   log();
-  info(`AI understood: ${message}`);
+  info(`AI understood: ${parsed.message}`);
   divider();
   info(`  To      : ${to}`);
-  info(`  Amount  : ${amount} USDC`);
+  info(`  Amount  : ${amount} ${token.symbol}`);
   info(`  Gas     : ~0.01 XDC (legacy tx, 12.5 gwei)`);
   divider();
 
-  // Confirmation prompt
   if (REQUIRE_CONFIRM) {
     const answer = await prompt(rl, "  Confirm send? (yes / no): ");
     if (answer.trim().toLowerCase() !== "yes") {
@@ -80,10 +120,12 @@ async function handleTransfer(rl, wallet, provider, parsed) {
 
   log();
   try {
-    const receipt = await sendUSDC(wallet, normalizedTo, amount);
+    const receipt = token.native
+      ? await sendNative(wallet, normalizedTo, amount)
+      : await sendToken(wallet, token, normalizedTo, amount);
 
     if (receipt.status === 1) {
-      success(`Sent ${amount} USDC successfully!`);
+      success(`Sent ${amount} ${token.symbol} successfully!`);
       success(`Tx hash : ${receipt.hash}`);
       success(`Explorer: ${EXPLORER}${receipt.hash}`);
       success(`Block   : ${receipt.blockNumber}`);
@@ -93,21 +135,134 @@ async function handleTransfer(rl, wallet, provider, parsed) {
   } catch (err) {
     error(`Transaction failed: ${err.reason || err.message}`);
     if (err.message.includes("insufficient funds")) {
-      warn("Check your USDC balance or XDC for gas.");
+      warn(`Check your ${token.symbol} balance or XDC for gas.`);
     }
   }
 }
 
+// ── Swap handler ───────────────────────────────────────────────────────────--
+
+async function handleSwap(rl, wallet, provider, parsed) {
+  const { amount } = parsed;
+  const fromToken = resolveToken(parsed.fromToken);
+  const toToken = resolveToken(parsed.toToken);
+
+  if (!fromToken || !toToken) {
+    const unknown = !fromToken ? parsed.fromToken : parsed.toToken;
+    error(`Unknown token: "${unknown}". Supported: ${listTokens().map((t) => t.symbol).join(", ")}`);
+    return;
+  }
+  if (fromToken.symbol === toToken.symbol) {
+    error("Cannot swap a token for itself.");
+    return;
+  }
+  if (!(amount > 0)) {
+    error(`Invalid amount: "${amount}".`);
+    return;
+  }
+  if (amount > MAX_SEND) {
+    error(`Amount ${amount} ${fromToken.symbol} exceeds safety limit of ${MAX_SEND}.`);
+    warn("Edit MAX_SEND_AMOUNT in .env to raise the limit.");
+    return;
+  }
+
+  // Resolve decimals for both sides (getTokenBalance caches them on the token).
+  try {
+    await getTokenBalance(provider, wallet.address, fromToken);
+    await getTokenBalance(provider, wallet.address, toToken);
+  } catch (err) {
+    error(`Could not read token details: ${err.reason || err.message}`);
+    return;
+  }
+
+  let quote;
+  try {
+    info("Fetching a quote from the DEX...");
+    quote = await quoteSwap(provider, fromToken, toToken, amount);
+  } catch (err) {
+    error(`Quote failed: ${err.reason || err.message}`);
+    warn("Check XSWAP_ROUTER_ADDRESS / WXDC_ADDRESS in .env, or that a liquidity pool exists.");
+    return;
+  }
+
+  log();
+  info(`AI understood: ${parsed.message}`);
+  divider();
+  info(`  Swap    : ${amount} ${fromToken.symbol} → ${toToken.symbol}`);
+  info(`  Expected: ~${parseFloat(quote.amountOut).toFixed(6)} ${toToken.symbol}`);
+  info(`  Min recv: ${parseFloat(quote.minOut).toFixed(6)} ${toToken.symbol} (slippage ${quote.slippage}%)`);
+  if (!fromToken.native) info(`  Note    : an approval tx may be sent first.`);
+  divider();
+
+  if (REQUIRE_CONFIRM) {
+    const answer = await prompt(rl, "  Confirm swap? (yes / no): ");
+    if (answer.trim().toLowerCase() !== "yes") {
+      warn("Swap cancelled.");
+      return;
+    }
+  }
+
+  log();
+  try {
+    const receipt = await executeSwap(wallet, fromToken, toToken, amount, quote);
+    if (receipt.status === 1) {
+      success(`Swapped ${amount} ${fromToken.symbol} → ${toToken.symbol}!`);
+      success(`Tx hash : ${receipt.hash}`);
+      success(`Explorer: ${EXPLORER}${receipt.hash}`);
+      success(`Block   : ${receipt.blockNumber}`);
+    } else {
+      error(`Swap reverted. Hash: ${receipt.hash}`);
+    }
+  } catch (err) {
+    error(`Swap failed: ${err.reason || err.message}`);
+    if (err.message.includes("insufficient funds")) {
+      warn(`Check your ${fromToken.symbol} balance or XDC for gas.`);
+    }
+  }
+}
+
+// ── Read-only handlers ─────────────────────────────────────────────────────--
+
+async function handleBalance(rl, wallet, provider) {
+  log();
+  info(`Wallet  : ${wallet.address}`);
+  printBalances(await fetchBalances(provider, wallet));
+}
+
+function handleHelp() {
+  log();
+  info("I can send tokens and swap on XDC Network from natural-language instructions.");
+  info("Examples:");
+  info('  "Send 10 USDC to xdc1abc..."');
+  info('  "Send 5 XDC to 0xDEAD..."');
+  info('  "Swap 100 USDC to XDC"');
+  info('  "What are my balances?"');
+  info(`Supported tokens: ${listTokens().map((t) => t.symbol).join(", ")}`);
+}
+
+function handleUnclear(rl, wallet, provider, parsed) {
+  warn(parsed.error || parsed.message || "I didn't understand that instruction.");
+  info('Try: "Send 10 USDC to xdc1a2b3c..." or "Swap 100 USDC to XDC"');
+}
+
+// Action → handler registry. Each handler gets (rl, wallet, provider, parsed).
+const HANDLERS = {
+  transfer: handleTransfer,
+  swap: handleSwap,
+  balance: handleBalance,
+  help: (rl, wallet, provider, parsed) => handleHelp(),
+  unclear: handleUnclear,
+};
+
 // ── Main loop ────────────────────────────────────────────────────────────────
 
 async function main() {
-  // Load wallet
   let provider, wallet, balances;
   try {
     provider = loadProvider();
     wallet = loadWallet(provider);
     log("\n  Loading wallet and fetching balances...");
-    balances = await getBalances(provider, wallet);
+    balances = await fetchBalances(provider, wallet);
   } catch (err) {
     error(err.message);
     process.exit(1);
@@ -135,52 +290,21 @@ async function main() {
 
     log();
 
-    // Refresh balances for context
-    try { balances = await getBalances(provider, wallet); } catch {}
+    // Refresh balances for parser context.
+    try { balances = await fetchBalances(provider, wallet); } catch {}
 
-    // Parse instruction via Claude AI
     let parsed;
     try {
       info("Thinking...");
-      parsed = await parseInstruction(input, {
-        walletAddress: wallet.address,
-        xdcBalance: balances.xdc,
-        usdcBalance: balances.usdc,
-      });
+      parsed = await parseInstruction(input, { walletAddress: wallet.address, tokens: balances });
     } catch (err) {
       error(`AI error: ${err.message}`);
       rl.prompt();
       return;
     }
 
-    // Handle intent
-    switch (parsed.action) {
-      case "transfer":
-        await handleTransfer(rl, wallet, provider, parsed);
-        break;
-
-      case "balance":
-        log();
-        info(`Wallet  : ${wallet.address}`);
-        info(`XDC     : ${balances.xdc} XDC`);
-        info(`USDC    : ${balances.usdc} ${balances.symbol}`);
-        break;
-
-      case "help":
-        log();
-        info("I can send USDC on XDC Network based on your instructions.");
-        info('Examples:');
-        info('  "Send 10 USDC to xdc1abc..."');
-        info('  "Transfer 50.5 USDC to 0xDEAD..."');
-        info('  "What is my balance?"');
-        break;
-
-      case "unclear":
-      default:
-        warn(parsed.error || parsed.message || "I didn't understand that instruction.");
-        info('Try: "Send 10 USDC to xdc1a2b3c..."');
-        break;
-    }
+    const handler = HANDLERS[parsed.action] || handleUnclear;
+    await handler(rl, wallet, provider, parsed);
 
     log();
     rl.prompt();
