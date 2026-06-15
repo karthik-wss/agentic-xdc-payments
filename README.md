@@ -122,15 +122,32 @@ xdc-multi-token-agent/
 
 ---
 
-## Security
+## Security best practices
 
-- **Never commit `.env`** — it contains your private key
-- Use a **dedicated agent wallet** with only what it needs
-- `MAX_SEND_AMOUNT` acts as a hard safety cap per transfer/swap
-- Set `REQUIRE_CONFIRMATION=true` (default) for manual approval of every send/swap
-- Swaps show the **expected output and minimum received** (after slippage) before you confirm
-- **Verify DEX addresses** (`XSWAP_ROUTER_ADDRESS`, `WXDC_ADDRESS`) against official sources before use
-- Test on **Apothem testnet** first — swaps interact with external DeFi contracts
+See the repo-wide [SECURITY.md](../SECURITY.md) for the full threat model and the
+production-hardening roadmap; [AUDIT.md](../AUDIT.md) lists the review findings.
+
+- **Prefer a hardware wallet for real value.** Set `WALLET_TYPE=ledger` (and install
+  `@ledgerhq/hw-app-eth` + `@ledgerhq/hw-transport-node-hid`) so keys never leave the
+  device and every send is confirmed on-device. Hot keys (`PRIVATE_KEY`/`MNEMONIC`)
+  are for **dev/CI only**.
+- **Never commit `.env`** — it may contain a private key or mnemonic.
+- Use a **dedicated agent wallet** funded with only what it needs.
+- Every send/swap is **simulated (`eth_call`) before you confirm** — predicted reverts
+  (insufficient balance/allowance, no liquidity) abort the action up front.
+- Gas limit is **estimated dynamically** (+20% buffer) with the per-op constants as a
+  floor; price is the XDC legacy floor (`XDC_GAS_PRICE_GWEI`, default 12.5 gwei).
+- `MAX_SEND_AMOUNT` is a hard per-tx cap; `REQUIRE_CONFIRMATION=true` (default) prompts
+  before every send/swap; swaps show expected output + minimum received after slippage.
+- A lightweight local rate limiter throttles the LLM parse calls (best-effort, single-process).
+- **Verify DEX addresses** (`XSWAP_ROUTER_ADDRESS`, `WXDC_ADDRESS`) against official
+  sources, and test on **Apothem testnet** first — swaps touch external DeFi contracts.
+
+## Tests
+
+`npm test` (Vitest) covers tokens, the parser, address/builder helpers, gas
+estimation fallback, simulation/error decoding, the rate limiter, and the Ledger
+signature adapter. `npm run test:coverage` for a coverage report.
 
 ---
 

@@ -5,12 +5,16 @@ import {
   getTokenBalance,
   sendToken,
   sendNative,
+  simulateTransfer,
   normalizeAddress,
   isValidAddress,
 } from "./erc20.js";
 import { resolveToken, listTokens } from "./tokens.js";
-import { quoteSwap, executeSwap } from "./swap.js";
+import { quoteSwap, executeSwap, simulateSwap } from "./swap.js";
 import { parseInstruction } from "./parser.js";
+import { describeChainError } from "./simulate.js";
+import { withRetry } from "./retry.js";
+import { take } from "./ratelimit.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -38,7 +42,7 @@ async function fetchBalances(provider, wallet) {
   return Promise.all(
     tokens.map(async (token) => {
       try {
-        return { symbol: token.symbol, balance: await getTokenBalance(provider, wallet.address, token) };
+        return { symbol: token.symbol, balance: await withRetry(() => getTokenBalance(provider, wallet.address, token)) };
       } catch {
         return { symbol: token.symbol, balance: "—" };
       }
@@ -102,12 +106,25 @@ async function handleTransfer(rl, wallet, provider, parsed) {
 
   const normalizedTo = normalizeAddress(to);
 
+  // Dry-run before asking the user to confirm, so reverts surface up front.
+  try {
+    const sim = await simulateTransfer(provider, wallet.address, token, normalizedTo, amount);
+    if (!sim.ok) {
+      error(`Simulation failed: ${sim.reason}`);
+      warn("Not sending — fix the issue above and try again.");
+      return;
+    }
+  } catch (err) {
+    warn(`Could not simulate the transfer (${describeChainError(err)}); proceeding with caution.`);
+  }
+
   log();
   info(`AI understood: ${parsed.message}`);
   divider();
   info(`  To      : ${to}`);
   info(`  Amount  : ${amount} ${token.symbol}`);
-  info(`  Gas     : ~0.01 XDC (legacy tx, 12.5 gwei)`);
+  info(`  Gas     : estimated dynamically (legacy tx, 12.5 gwei)`);
+  info(`  Check   : ✓ simulated OK`);
   divider();
 
   if (REQUIRE_CONFIRM) {
@@ -133,8 +150,8 @@ async function handleTransfer(rl, wallet, provider, parsed) {
       error(`Transaction reverted. Hash: ${receipt.hash}`);
     }
   } catch (err) {
-    error(`Transaction failed: ${err.reason || err.message}`);
-    if (err.message.includes("insufficient funds")) {
+    error(`Transaction failed: ${describeChainError(err)}`);
+    if ((err.message || "").includes("insufficient funds")) {
       warn(`Check your ${token.symbol} balance or XDC for gas.`);
     }
   }
@@ -178,11 +195,25 @@ async function handleSwap(rl, wallet, provider, parsed) {
   let quote;
   try {
     info("Fetching a quote from the DEX...");
-    quote = await quoteSwap(provider, fromToken, toToken, amount);
+    quote = await withRetry(() => quoteSwap(provider, fromToken, toToken, amount));
   } catch (err) {
-    error(`Quote failed: ${err.reason || err.message}`);
+    error(`Quote failed: ${describeChainError(err)}`);
     warn("Check XSWAP_ROUTER_ADDRESS / WXDC_ADDRESS in .env, or that a liquidity pool exists.");
     return;
+  }
+
+  // Dry-run the swap (skipped automatically when an approval is still required).
+  let simNote = "✓ simulated OK";
+  try {
+    const sim = await simulateSwap(provider, wallet.address, fromToken, toToken, amount, quote);
+    if (!sim.ok) {
+      error(`Simulation failed: ${sim.reason}`);
+      warn("Not swapping — fix the issue above and try again.");
+      return;
+    }
+    if (sim.reason) simNote = sim.reason; // e.g. "Skipped — approval required first."
+  } catch (err) {
+    simNote = `could not simulate (${describeChainError(err)})`;
   }
 
   log();
@@ -191,6 +222,7 @@ async function handleSwap(rl, wallet, provider, parsed) {
   info(`  Swap    : ${amount} ${fromToken.symbol} → ${toToken.symbol}`);
   info(`  Expected: ~${parseFloat(quote.amountOut).toFixed(6)} ${toToken.symbol}`);
   info(`  Min recv: ${parseFloat(quote.minOut).toFixed(6)} ${toToken.symbol} (slippage ${quote.slippage}%)`);
+  info(`  Check   : ${simNote}`);
   if (!fromToken.native) info(`  Note    : an approval tx may be sent first.`);
   divider();
 
@@ -214,8 +246,8 @@ async function handleSwap(rl, wallet, provider, parsed) {
       error(`Swap reverted. Hash: ${receipt.hash}`);
     }
   } catch (err) {
-    error(`Swap failed: ${err.reason || err.message}`);
-    if (err.message.includes("insufficient funds")) {
+    error(`Swap failed: ${describeChainError(err)}`);
+    if ((err.message || "").includes("insufficient funds")) {
       warn(`Check your ${fromToken.symbol} balance or XDC for gas.`);
     }
   }
@@ -260,8 +292,8 @@ async function main() {
   let provider, wallet, balances;
   try {
     provider = loadProvider();
-    wallet = loadWallet(provider);
     log("\n  Loading wallet and fetching balances...");
+    wallet = await loadWallet(provider);
     balances = await fetchBalances(provider, wallet);
   } catch (err) {
     error(err.message);
@@ -289,6 +321,14 @@ async function main() {
     }
 
     log();
+
+    // Best-effort local throttle so a runaway loop can't hammer the LLM API.
+    const gate = take("parse", { capacity: 8, refillPerSec: 0.5 });
+    if (!gate.allowed) {
+      warn(`Slow down — try again in ~${Math.ceil(gate.retryAfterMs / 1000)}s.`);
+      rl.prompt();
+      return;
+    }
 
     // Refresh balances for parser context.
     try { balances = await fetchBalances(provider, wallet); } catch {}

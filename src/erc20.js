@@ -1,4 +1,6 @@
 import { ethers } from "ethers";
+import { LEGACY_GAS, GAS_LIMITS, estimateGasWithFallback } from "./gas.js";
+import { simulateTx } from "./simulate.js";
 
 const ERC20_ABI = [
   "function transfer(address to, uint256 amount) returns (bool)",
@@ -9,11 +11,7 @@ const ERC20_ABI = [
   "function symbol() view returns (string)",
 ];
 
-// XDC Network requires legacy transactions (type 0), not EIP-1559.
-const LEGACY_GAS = {
-  type: 0,
-  gasPrice: ethers.parseUnits("12.5", "gwei"),
-};
+const ERC20_IFACE = new ethers.Interface(ERC20_ABI);
 
 /**
  * Lazily fills (and caches) a token's on-chain decimals using a contract we
@@ -59,12 +57,13 @@ export async function getTokenBalance(provider, owner, token) {
  * @returns {Promise<ethers.TransactionReceipt>}
  */
 export async function sendNative(wallet, to, amount) {
-  const tx = await wallet.sendTransaction({
-    to,
-    value: ethers.parseEther(amount.toString()),
-    gasLimit: 21_000n,
-    ...LEGACY_GAS,
-  });
+  const value = ethers.parseEther(amount.toString());
+  const gasLimit = await estimateGasWithFallback(
+    wallet.provider,
+    { to, value, from: wallet.address },
+    GAS_LIMITS.native,
+  );
+  const tx = await wallet.sendTransaction({ to, value, gasLimit, ...LEGACY_GAS });
 
   console.log(`\n  Transaction sent: ${tx.hash}`);
   console.log("  Waiting for confirmation...");
@@ -85,7 +84,13 @@ export async function sendToken(wallet, token, to, amount) {
   const decimals = await fillDecimals(token, contract);
   const amountWei = ethers.parseUnits(amount.toString(), decimals);
 
-  const tx = await contract.transfer(to, amountWei, { gasLimit: 100_000n, ...LEGACY_GAS });
+  const req = await contract.transfer.populateTransaction(to, amountWei);
+  const gasLimit = await estimateGasWithFallback(
+    wallet.provider,
+    { ...req, from: wallet.address },
+    GAS_LIMITS.tokenTransfer,
+  );
+  const tx = await contract.transfer(to, amountWei, { gasLimit, ...LEGACY_GAS });
 
   console.log(`\n  Transaction sent: ${tx.hash}`);
   console.log("  Waiting for confirmation...");
@@ -115,11 +120,38 @@ export async function approve(wallet, token, spender, amount) {
   const decimals = await fillDecimals(token, contract);
   const amountWei = ethers.parseUnits(amount.toString(), decimals);
 
-  const tx = await contract.approve(spender, amountWei, { gasLimit: 80_000n, ...LEGACY_GAS });
+  const req = await contract.approve.populateTransaction(spender, amountWei);
+  const gasLimit = await estimateGasWithFallback(
+    wallet.provider,
+    { ...req, from: wallet.address },
+    GAS_LIMITS.approve,
+  );
+  const tx = await contract.approve(spender, amountWei, { gasLimit, ...LEGACY_GAS });
 
   console.log(`\n  Approval sent: ${tx.hash}`);
   console.log("  Waiting for confirmation...");
   return tx.wait();
+}
+
+/**
+ * Dry-runs a transfer (native or ERC-20) before signing. Authoritative for
+ * ERC-20 (catches "exceeds balance"); best-effort for native sends.
+ *
+ * @param {ethers.Provider} provider
+ * @param {string} from     - sender (0x)
+ * @param {object} token    - registry token
+ * @param {string} to       - recipient (0x)
+ * @param {number|string} amount
+ * @returns {Promise<{ ok: true } | { ok: false, reason: string }>}
+ */
+export async function simulateTransfer(provider, from, token, to, amount) {
+  if (token.native) {
+    return simulateTx(provider, { to, value: ethers.parseEther(amount.toString()), from });
+  }
+  const contract = new ethers.Contract(token.address, ERC20_ABI, provider);
+  const decimals = await fillDecimals(token, contract);
+  const data = ERC20_IFACE.encodeFunctionData("transfer", [to, ethers.parseUnits(amount.toString(), decimals)]);
+  return simulateTx(provider, { to: token.address, data, from });
 }
 
 /**

@@ -1,5 +1,7 @@
 import { ethers } from "ethers";
 import { approve, getAllowance } from "./erc20.js";
+import { LEGACY_GAS, GAS_LIMITS, estimateGasWithFallback } from "./gas.js";
+import { simulateTx } from "./simulate.js";
 
 /**
  * DEX swaps via a UniswapV2-style router (XSwap on XDC).
@@ -20,12 +22,47 @@ const ROUTER_ABI = [
   "function swapExactTokensForETH(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) returns (uint256[] amounts)",
 ];
 
-const LEGACY_GAS = {
-  type: 0,
-  gasPrice: ethers.parseUnits("12.5", "gwei"),
-};
-const SWAP_GAS_LIMIT = 300_000n;
+const ROUTER_IFACE = new ethers.Interface(ROUTER_ABI);
 const DEADLINE_SECONDS = 1200; // 20 minutes
+
+/** Encodes the correct router call + value for a swap, by native side. */
+function buildSwapData(fromToken, toToken, quote, to, deadline) {
+  const { amountInWei, minOutWei, path } = quote;
+  if (fromToken.native) {
+    return {
+      data: ROUTER_IFACE.encodeFunctionData("swapExactETHForTokens", [minOutWei, path, to, deadline]),
+      value: amountInWei,
+    };
+  }
+  if (toToken.native) {
+    return {
+      data: ROUTER_IFACE.encodeFunctionData("swapExactTokensForETH", [amountInWei, minOutWei, path, to, deadline]),
+      value: 0n,
+    };
+  }
+  return {
+    data: ROUTER_IFACE.encodeFunctionData("swapExactTokensForTokens", [amountInWei, minOutWei, path, to, deadline]),
+    value: 0n,
+  };
+}
+
+/**
+ * Dry-runs a swap before signing. Skips token-input swaps that still need an
+ * approval (those necessarily revert in eth_call and the approval is expected).
+ *
+ * @returns {Promise<{ ok: true, reason?: string } | { ok: false, reason: string }>}
+ */
+export async function simulateSwap(provider, from, fromToken, toToken, amount, quote) {
+  if (!fromToken.native) {
+    const allowance = await getAllowance(provider, fromToken, from, routerAddress());
+    if (allowance < quote.amountInWei) {
+      return { ok: true, reason: "Skipped — approval required first." };
+    }
+  }
+  const deadline = Math.floor(Date.now() / 1000) + DEADLINE_SECONDS;
+  const { data, value } = buildSwapData(fromToken, toToken, quote, from, deadline);
+  return simulateTx(provider, { to: routerAddress(), data, value, from });
+}
 
 function routerAddress() {
   const addr = process.env.XSWAP_ROUTER_ADDRESS;
@@ -122,27 +159,32 @@ export async function executeSwap(wallet, fromToken, toToken, amount, quote) {
     }
   }
 
-  let tx;
+  // Resolve the right router method + populated request, then estimate gas once.
+  let method, methodArgs, overrides;
   if (fromToken.native) {
     // XDC -> token
-    tx = await router.swapExactETHForTokens(minOutWei, path, to, deadline, {
-      value: amountInWei,
-      gasLimit: SWAP_GAS_LIMIT,
-      ...LEGACY_GAS,
-    });
+    method = router.swapExactETHForTokens;
+    methodArgs = [minOutWei, path, to, deadline];
+    overrides = { value: amountInWei };
   } else if (toToken.native) {
     // token -> XDC
-    tx = await router.swapExactTokensForETH(amountInWei, minOutWei, path, to, deadline, {
-      gasLimit: SWAP_GAS_LIMIT,
-      ...LEGACY_GAS,
-    });
+    method = router.swapExactTokensForETH;
+    methodArgs = [amountInWei, minOutWei, path, to, deadline];
+    overrides = {};
   } else {
     // token -> token
-    tx = await router.swapExactTokensForTokens(amountInWei, minOutWei, path, to, deadline, {
-      gasLimit: SWAP_GAS_LIMIT,
-      ...LEGACY_GAS,
-    });
+    method = router.swapExactTokensForTokens;
+    methodArgs = [amountInWei, minOutWei, path, to, deadline];
+    overrides = {};
   }
+
+  const req = await method.populateTransaction(...methodArgs, overrides);
+  const gasLimit = await estimateGasWithFallback(
+    wallet.provider,
+    { ...req, from: to },
+    GAS_LIMITS.swap,
+  );
+  const tx = await method(...methodArgs, { ...overrides, gasLimit, ...LEGACY_GAS });
 
   console.log(`\n  Swap sent: ${tx.hash}`);
   console.log("  Waiting for confirmation...");
