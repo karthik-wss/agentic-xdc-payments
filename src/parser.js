@@ -1,6 +1,47 @@
 import Anthropic from "@anthropic-ai/sdk";
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const GROK_BASE_URL = "https://api.x.ai/v1";
+const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-5";
+const DEFAULT_GROK_MODEL = "grok-4.3";
+
+/**
+ * Resolves which LLM provider to use: an explicit LLM_PROVIDER override wins,
+ * otherwise auto-detect Grok when XAI_API_KEY is present, else Anthropic.
+ * @returns {"anthropic" | "grok"}
+ */
+function resolveProvider() {
+  const explicit = (process.env.LLM_PROVIDER || "").toLowerCase();
+  if (explicit === "grok" || explicit === "anthropic") return explicit;
+  if (process.env.XAI_API_KEY) return "grok";
+  return "anthropic";
+}
+
+/** The active { provider, model }, for display (e.g. the startup banner). */
+export function activeLLM() {
+  const provider = resolveProvider();
+  const model =
+    provider === "grok"
+      ? process.env.GROK_MODEL || DEFAULT_GROK_MODEL
+      : process.env.ANTHROPIC_MODEL || DEFAULT_ANTHROPIC_MODEL;
+  return { provider, model };
+}
+
+// Clients are created lazily so importing this module never requires a key or
+// the optional `openai` package unless the matching provider is actually used.
+let anthropicClient;
+function getAnthropic() {
+  if (!anthropicClient) anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  return anthropicClient;
+}
+
+let grokClient;
+async function getGrok() {
+  if (!grokClient) {
+    const { default: OpenAI } = await import("openai");
+    grokClient = new OpenAI({ apiKey: process.env.XAI_API_KEY, baseURL: GROK_BASE_URL });
+  }
+  return grokClient;
+}
 
 const SYSTEM_PROMPT = `You are an autonomous on-chain agent running on XDC Network.
 Your job is to parse natural language instructions into a structured intent.
@@ -35,8 +76,8 @@ Rules:
 - Keep 'message' short (1 sentence).`;
 
 /**
- * Parses a natural language instruction using Claude AI.
- * Returns a structured intent object.
+ * Parses a natural language instruction into a structured intent, using whichever
+ * LLM provider is active (Anthropic Claude or xAI Grok — see resolveProvider()).
  *
  * @param {string} userInstruction
  * @param {object} context  - { walletAddress, tokens: [{ symbol, balance }] }
@@ -51,14 +92,31 @@ export async function parseInstruction(userInstruction, context = {}) {
     `\n\nSUPPORTED TOKENS: ${tokenList}` +
     (context.walletAddress ? `\nCurrent wallet: ${context.walletAddress}` : "");
 
-  const response = await client.messages.create({
-    model: "claude-sonnet-4-5",
-    max_tokens: 512,
-    system: SYSTEM_PROMPT + contextNote,
-    messages: [{ role: "user", content: userInstruction }],
-  });
+  const system = SYSTEM_PROMPT + contextNote;
+  let raw;
 
-  const raw = response.content.find((b) => b.type === "text")?.text || "{}";
+  if (resolveProvider() === "grok") {
+    // Grok speaks the OpenAI-compatible Chat Completions API; force JSON output.
+    const grok = await getGrok();
+    const response = await grok.chat.completions.create({
+      model: process.env.GROK_MODEL || DEFAULT_GROK_MODEL,
+      max_tokens: 512,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: userInstruction },
+      ],
+    });
+    raw = response.choices?.[0]?.message?.content || "{}";
+  } else {
+    const response = await getAnthropic().messages.create({
+      model: process.env.ANTHROPIC_MODEL || DEFAULT_ANTHROPIC_MODEL,
+      max_tokens: 512,
+      system,
+      messages: [{ role: "user", content: userInstruction }],
+    });
+    raw = response.content.find((b) => b.type === "text")?.text || "{}";
+  }
 
   try {
     return JSON.parse(raw.replace(/```json|```/g, "").trim());

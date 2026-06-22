@@ -11,7 +11,7 @@ import {
 } from "./erc20.js";
 import { resolveToken, listTokens } from "./tokens.js";
 import { quoteSwap, executeSwap, simulateSwap } from "./swap.js";
-import { parseInstruction } from "./parser.js";
+import { parseInstruction, activeLLM } from "./parser.js";
 import { describeChainError } from "./simulate.js";
 import { withRetry } from "./retry.js";
 import { take } from "./ratelimit.js";
@@ -65,6 +65,8 @@ function printBanner(walletAddress, balances) {
   info(`Wallet  : ${walletAddress}`);
   printBalances(balances);
   info(`Network : ${process.env.XDC_RPC_URL || "https://rpc.xinfin.network"}`);
+  const llm = activeLLM();
+  info(`LLM     : ${llm.provider === "grok" ? "xAI Grok" : "Anthropic"} (${llm.model})`);
   info(`Confirm : ${REQUIRE_CONFIRM ? "ON (you will approve each action)" : "OFF (auto-executes)"}`);
   console.log();
   info("Type a natural instruction, e.g:");
